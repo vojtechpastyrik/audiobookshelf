@@ -1,0 +1,112 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: patches
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  'upstream-sync[bot]'
+          git config user.email 'upstream-sync@users.noreply.github.com'
+          git config rerere.enabled true
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/advplyr/audiobookshelf.git
+          git fetch upstream --tags --force
+
+      - name: Resolve versions
+        id: v
+        run: |
+          latest=$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -vE -- '-(alpha|beta|rc)' | head -1)
+          current=$(cat .upstream-base)
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$current" ]; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already on $current"
+          else
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$current -> $latest"
+          fi
+
+      - name: Rebase patches onto ${{ steps.v.outputs.latest }}
+        if: steps.v.outputs.uptodate == 'false'
+        id: rebase
+        run: |
+          set -o pipefail
+          if ! git rebase --onto "${{ steps.v.outputs.latest }}" "${{ steps.v.outputs.current }}" patches 2>&1 | tee /tmp/rebase.log; then
+            git rebase --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The tip commit only carries .upstream-base; amend it instead of
+          # stacking a new tracking commit on every release.
+          echo "${{ steps.v.outputs.latest }}" > .upstream-base
+          git commit -q --amend -am "chore: track upstream ${{ steps.v.outputs.latest }}"
+          git push --force-with-lease origin patches
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const log = fs.readFileSync('/tmp/rebase.log', 'utf8').slice(-4000)
+            const latest = '${{ steps.v.outputs.latest }}'
+            const current = '${{ steps.v.outputs.current }}'
+            // Headings matter: the inherited close_blank_issues workflow closes
+            // any issue with fewer than three markdown headings.
+            const body = [
+              '## What happened',
+              '',
+              `Patches no longer apply on top of \`${latest}\`. The \`latest\` image still points at \`${current}\`.`,
+              '',
+              '## How to fix',
+              '',
+              '```sh',
+              'git fetch upstream --tags',
+              'git switch patches',
+              `git rebase --onto ${latest} ${current} patches`,
+              '# fix conflicts, then:',
+              `echo ${latest} > .upstream-base`,
+              `git commit --amend -am "chore: track upstream ${latest}"`,
+              'git push --force-with-lease origin patches',
+              '```',
+              '',
+              'If upstream fixed the issue the patch addresses, drop that commit instead of porting it.',
+              '',
+              '## Rebase log',
+              '',
+              '<details><summary>show</summary>',
+              '',
+              '```',
+              log,
+              '```',
+              '</details>'
+            ].join('\n')
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Rebase onto ${latest} failed`,
+              body
+            })
