@@ -22,6 +22,10 @@ class ApiCacheManager {
   getModelName(model) {
     if (typeof model?.name === 'string') return model.name
     if (typeof model?.model?.name === 'string') return model.model.name
+    // Sequelize passes afterUpsert `[instance, created]`, so the bare
+    // constructor check below resolves to 'Array' and misses highChurnModels,
+    // clearing the whole cache on every playbackSession upsert.
+    if (Array.isArray(model)) return this.getModelName(model[0])
     if (typeof model?.constructor?.name === 'string' && model.constructor.name !== 'Object') return model.constructor.name
     return 'unknown'
   }
