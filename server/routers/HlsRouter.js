@@ -77,7 +77,9 @@ class HlsRouter {
       if (fileExt === '.ts') {
         const segNum = this.parseSegmentFilename(req.params.file)
 
-        if (stream.isResetting) {
+        if (stream.isLingering) {
+          Logger.info(`[HlsRouter] Stream ${streamId} is lingering after session close - not resetting transcode`)
+        } else if (stream.isResetting) {
           Logger.info(`[HlsRouter] Stream ${streamId} is currently resetting`)
         } else {
           const startTimeForReset = await stream.checkSegmentNumberRequest(segNum)

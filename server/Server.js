@@ -563,6 +563,8 @@ class Server {
     Logger.info('=== Stopping Server ===')
     Watcher.close()
     Logger.info('[Server] Watcher Closed')
+    await this.playbackSessionManager.closeLingeringStreams()
+    Logger.info('[Server] Lingering Streams Closed')
     await SocketAuthority.close()
     Logger.info('[Server] Closing HTTP Server')
     await new Promise((resolve) => this.server.close(resolve))

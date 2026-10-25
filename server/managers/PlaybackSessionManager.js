@@ -11,12 +11,22 @@ const uaParserJs = require('../libs/uaParser')
 const requestIp = require('../libs/requestIp')
 
 const { PlayMethod } = require('../utils/constants')
+const { toNumber } = require('../utils/index')
 
 const PlaybackSession = require('../objects/PlaybackSession')
 const DeviceInfo = require('../objects/DeviceInfo')
 const Stream = require('../objects/Stream')
 
 class PlaybackSessionManager {
+  /**
+   * How long a transcode stream stays resolvable after its session is closed.
+   * Mobile clients that are backgrounded mid-playback keep requesting segments
+   * from the session they had open; without a grace period every one of those
+   * is a 404 and playback never resumes until the user reopens the book.
+   * @see https://github.com/advplyr/audiobookshelf/issues/5612
+   */
+  static StreamGracePeriodMs = toNumber(process.env.STREAM_GRACE_PERIOD_MS, 10 * 60 * 1000)
+
   constructor() {
     this.StreamsPath = Path.join(global.MetadataPath, 'streams')
 
@@ -24,6 +34,9 @@ class PlaybackSessionManager {
 
     /** @type {PlaybackSession[]} */
     this.sessions = []
+
+    /** @type {Map<string, {stream: Stream, timeout: NodeJS.Timeout}>} */
+    this.closedStreams = new Map()
   }
 
   /**
@@ -40,7 +53,8 @@ class PlaybackSessionManager {
   }
   getStream(sessionId) {
     const session = this.getSession(sessionId)
-    return session?.stream || null
+    if (session?.stream) return session.stream
+    return this.closedStreams.get(sessionId)?.stream || null
   }
 
   /**
@@ -449,10 +463,58 @@ class PlaybackSessionManager {
     const session = this.sessions.find((s) => s.id === sessionId)
     if (!session) return
     if (session.stream) {
-      await session.stream.close()
+      await this.lingerStream(session.stream)
     }
     this.sessions = this.sessions.filter((s) => s.id !== sessionId)
     Logger.debug(`[PlaybackSessionManager] Removed session "${sessionId}"`)
+  }
+
+  /**
+   * Keep a closed session's stream resolvable for the grace period instead of
+   * tearing it down immediately. The transcode is stopped right away, but the
+   * segments already on disk stay servable, so a client resuming from the
+   * background keeps playing. If it seeks past what was transcoded, HlsRouter's
+   * existing `checkSegmentNumberRequest` path restarts ffmpeg at that position.
+   *
+   * @param {Stream} stream
+   */
+  async lingerStream(stream) {
+    const gracePeriod = PlaybackSessionManager.StreamGracePeriodMs
+    if (gracePeriod <= 0) {
+      return stream.close()
+    }
+
+    if (this.closedStreams.has(stream.id)) return
+
+    stream.isLingering = true
+    stream.cancelTranscode()
+
+    const timeout = setTimeout(() => {
+      this.closedStreams.delete(stream.id)
+      Logger.debug(`[PlaybackSessionManager] Grace period expired for stream "${stream.id}"`)
+      stream.close().catch((error) => {
+        Logger.error(`[PlaybackSessionManager] Failed to close lingering stream "${stream.id}"`, error)
+      })
+    }, gracePeriod)
+    timeout.unref?.()
+
+    this.closedStreams.set(stream.id, { stream, timeout })
+    Logger.info(`[PlaybackSessionManager] Stream "${stream.id}" kept for ${gracePeriod}ms after session close`)
+  }
+
+  /**
+   * Tear down every lingering stream now. Used on shutdown so ffmpeg children
+   * and `/metadata/streams` directories do not outlive the process.
+   */
+  async closeLingeringStreams() {
+    const lingering = [...this.closedStreams.values()]
+    this.closedStreams.clear()
+    for (const { stream, timeout } of lingering) {
+      clearTimeout(timeout)
+      await stream.close().catch((error) => {
+        Logger.error(`[PlaybackSessionManager] Failed to close lingering stream "${stream.id}"`, error)
+      })
+    }
   }
 
   /**

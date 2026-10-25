@@ -35,6 +35,10 @@ class Stream extends EventEmitter {
     this.ffmpeg = null
     this.loop = null
     this.isResetting = false
+    // Set once the owning session is closed. A lingering stream serves the
+    // segments it already produced but must never spawn ffmpeg again - there is
+    // no session left to sync progress against.
+    this.isLingering = false
     this.isClientInitialized = false
     this.isTranscodeComplete = false
     this.segmentsCreated = new Set()
